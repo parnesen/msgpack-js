@@ -388,10 +388,7 @@ function encode(value, buffer, offset) {
       }
       // uint 64
       if (value < 0x10000000000000000) {
-        console.log("writeUInt53");
         buffer[offset] = 0xcf;
-
-
         writeUint53(value, buffer, offset + 1);
         return 9;
       }
