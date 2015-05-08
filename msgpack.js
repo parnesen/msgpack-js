@@ -2,9 +2,100 @@
 
 var bops = require('bops');
 
+var bytePositions = [
+  0x1000000000000,
+  0x10000000000,
+  0x100000000,
+  0x1000000,
+  0x10000,
+  0x100,
+  0x1
+]
+
+/** reads an unsigned int of max value 2^53-1 from a uint64 binary representation **/
+function readUint53(bytes, offset) {
+  var value = 0;
+  for(var ii = 1; ii < 8; ii++) { //we can skip the most significant byte
+    value = (value * 0x100) + bytes[offset + ii];
+  }
+  if (value > 9007199254740991) throw "Overflow";
+  return value;
+}
+
+/** reads an signed int of max/min value +- 2^53-1 from a big endian two's complement int64 binary representation **/
+function readInt53(bytes, offset) {
+  var num;
+  if(isNegative(bytes, offset)) {
+    var copy = copyBytes(8, bytes, offset);
+    negate(copy, 0);
+    var absValue = readUint53(copy, 0);
+    num = -absValue;
+  }
+  else {
+    //we can treat bytes this as a UINT because in two's complement notation, positive numbers much
+    //smaller than MaxUint64 are represented as just themselves.
+    num = readUint53(bytes, offset);
+  }
+  return num;
+}
+
+function writeUint53(value, buffer, offset) {
+  value = Math.floor(value);
+  if (value > 9007199254740991) throw "Overflow";
+
+  buffer[offset] = 0x0; //most significant bit is always zero
+  var accumulator = 0;
+  for(var ii = 1; ii < 8; ii++) {
+    buffer[offset + ii] = Math.floor((value / bytePositions[ii - 1]) - accumulator);
+    accumulator = (accumulator + buffer[offset + ii]) * 0x100;
+  }
+}
+
+function writeInt53(value, buffer, offset) {
+  if(value >= 0) {
+    //we can treat this as a UINT because in two's complement notation, positive numbers much
+    //smaller than MaxUint64 are represented as just themselves.
+    writeUint53(value, buffer, offset);
+  }
+  else {
+    writeUint53(-value, buffer, offset);
+    negate(buffer, offset);
+  }
+}
+
+function copyBytes(count, buffer, offset) {
+  var bytes = new Array(count);
+  for(var ii = 0; ii < 8; ii++) {
+    bytes[ii] = buffer[offset + ii];
+  }
+  return bytes;
+}
+
+/** determines whether the given big endian, two's complement byte representation of a 64 bit integer is negative **/
+function isNegative(bytes, offset) {
+  //check the most significant bit.
+  return (bytes[offset] & 0x80) !== 0;
+}
+
+/** negates the given big endian byte representation of a 64 bit integer by taking the two's complement **/
+function negate(bytes, offset) {
+  var overflow = 1;
+  for(var ii = 7; ii >= 0; ii--) {
+    var byte = bytes[offset + ii];
+    var onesCompliment = ~byte & 0xFF;
+    var twosComplement = onesCompliment + overflow;
+    overflow = (twosComplement & 0x100) == 0 ? 0 : 1;
+    var negated = twosComplement & 0xFF;
+    bytes[offset + ii] = negated;
+  }
+}
+
+
 exports.encode = function (value) {
-  var size = sizeof(value);
-  if (size === 0) return undefined;
+  var toJSONed = []
+  var size = sizeof(value)
+  if(size == 0)
+    return undefined
   var buffer = bops.create(size);
   encode(value, buffer, 0);
   return buffer;
@@ -126,7 +217,7 @@ Decoder.prototype.parse = function () {
     return value;
   // uint64
   case 0xcf:
-    value = bops.readUInt64BE(this.buffer, this.offset + 1);
+    value = readUint53(this.buffer, this.offset + 1);
     this.offset += 9;
     return value;
   // int 8
@@ -146,7 +237,7 @@ Decoder.prototype.parse = function () {
     return value;
   // int 64
   case 0xd3:
-    value = bops.readInt64BE(this.buffer, this.offset + 1);
+    value = readInt53(this.buffer, this.offset + 1);
     this.offset += 9;
     return value;
   // map 16
@@ -201,8 +292,8 @@ function decode(buffer) {
 
 function encodeableKeys (value) {
   return Object.keys(value).filter(function (e) {
-    return typeof value[e] !== 'function' || value[e].toJSON;
-  });
+    return 'function' !== typeof value[e] || !!value[e].toJSON
+  })
 }
 
 function encode(value, buffer, offset) {
@@ -254,12 +345,21 @@ function encode(value, buffer, offset) {
   }
 
   if (type === "number") {
+
+    //parnesen May 2015
+    //the comms_endpoint protocol doesn't support floats at the moment
+    // also,the commented out test doesn't work for ints > 32bit. It sees them all as floats,
+    //probably because bit-shift operations such as << treats the value as a 32bit word and so doesn't work
+    //peroperly on 64bit values.
+
     // Floating Point
-    if ((value << 0) !== value) {
-      buffer[offset] =  0xcb;
-      bops.writeDoubleBE(buffer, value, offset + 1);
-      return 9;
-    }
+    //if ((value << 0) !== value) {
+    //  buffer[offset] =  0xcb;
+    //  bops.writeDoubleBE(buffer, value, offset + 1);
+    //  return 9;
+    //}
+
+    value = Math.floor(value);
 
     // Integers
     if (value >=0) {
@@ -288,8 +388,11 @@ function encode(value, buffer, offset) {
       }
       // uint 64
       if (value < 0x10000000000000000) {
+        console.log("writeUInt53");
         buffer[offset] = 0xcf;
-        bops.writeUInt64BE(buffer, value, offset + 1);
+
+
+        writeUint53(value, buffer, offset + 1);
         return 9;
       }
       throw new Error("Number too big 0x" + value.toString(16));
@@ -320,7 +423,7 @@ function encode(value, buffer, offset) {
     // int 64
     if (value >= -0x8000000000000000) {
       buffer[offset] = 0xd3;
-      bops.writeInt64BE(buffer, value, offset + 1);
+      writeInt53(value, buffer, offset + 1);
       return 9;
     }
     throw new Error("Number too small -0x" + value.toString(16).substr(1));
@@ -344,10 +447,8 @@ function encode(value, buffer, offset) {
     return 1;
   }
 
-  // Custom toJSON function.
-  if (typeof value.toJSON === 'function') {
-    return encode(value.toJSON(), buffer, offset);
-  }
+  if('function' === typeof value.toJSON)
+    return encode(value.toJSON(), buffer, offset)
 
   // Container Types
   if (type === "object") {
@@ -359,7 +460,7 @@ function encode(value, buffer, offset) {
       length = value.length;
     }
     else {
-      var keys = encodeableKeys(value);
+      var keys = encodeableKeys(value)
       length = keys.length;
     }
 
@@ -393,7 +494,8 @@ function encode(value, buffer, offset) {
 
     return size;
   }
-  if (type === "function") return undefined;
+  if(type === "function")
+    return undefined
   throw new Error("Unknown type " + type);
 }
 
@@ -461,15 +563,13 @@ function sizeof(value) {
   // Boolean, null, undefined
   if (type === "boolean" || type === "undefined" || value === null) return 1;
 
-  if (typeof value.toJSON === 'function') {
-    return sizeof(value.toJSON());
-  }
+  if('function' === typeof value.toJSON)
+    return sizeof(value.toJSON())
 
   // Container Types
   if (type === "object") {
-    if ('function' === typeof value.toJSON) {
-      value = value.toJSON();
-    }
+    if('function' === typeof value.toJSON)
+      value = value.toJSON()
 
     size = 0;
     if (Array.isArray(value)) {
@@ -479,7 +579,7 @@ function sizeof(value) {
       }
     }
     else {
-      var keys = encodeableKeys(value);
+      var keys = encodeableKeys(value)
       length = keys.length;
       for (var i = 0; i < length; i++) {
         var key = keys[i];
@@ -497,10 +597,10 @@ function sizeof(value) {
     }
     throw new Error("Array or object too long 0x" + length.toString(16));
   }
-  if (type === "function") {
-    return 0;
-  }
+  if(type === "function")
+    return 0
   throw new Error("Unknown type " + type);
 }
+
 
 
